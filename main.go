@@ -9,334 +9,399 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/sftp"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/ssh"
 )
 
 const (
 	localWatchDir  = "./audios"
+	stage2Upload   = "./temp/2_upload"
+	stage3Gpu      = "./temp/3_gpu"
+	stage4Download = "./temp/4_done"
+	localOldDir    = "./audios_old"
+	localTransDir  = "./transcricoes"
+
 	remoteHost     = "20.127.212.253"
 	remoteUser     = "speaksense"
 	remoteKeyPath  = "vm-speaksense-eus-dev_key.pem"
 	remoteAudioDir = "/home/speaksense/whisper-gpu-test-paralel/audios"
+	remoteTempDir  = "/home/speaksense/whisper-gpu-test-paralel/audios_temp"
 	remoteTransDir = "/home/speaksense/whisper-gpu-test-paralel/transcricoes"
-	remoteWorkDir  = "/home/speaksense/whisper-gpu-test-paralel"
-	remoteScript   = "python3 parallel_transcribe.py"
-	localOldDir    = "./audios_old"
-	localTransDir  = "./transcricoes"
-	mongoURI       = "mongodb://root:STInfra123@10.0.68.120:27017/transcription?authSource=transcriptions"
-	mongoDB        = "transcription"
-	mongoColl      = "transcriptions"
+
+	postgresURL = "postgres://srvbi:NbHo2WB8EyzatlPjmD1e@10.0.68.39:5433/transcriberdb"
 )
 
-type TranscriptionDoc struct {
-	FileName    string                 `bson:"file_name"`
-	Content     string                 `bson:"content"`
-	ProcessedAt time.Time              `bson:"processed_at"`
-	AudioPath   string                 `bson:"audio_path"`
-	Metadata    map[string]interface{} `bson:"metadata,omitempty"`
+type Segment struct {
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Text    string  `json:"text"`
+	Speaker string  `json:"speaker,omitempty"`
 }
 
-var mongoClient *mongo.Client
+var (
+	dbPool           *pgxpool.Pool
+	fileTimestamps   sync.Map
+	activeProcessing sync.Map
 
-func initMongoClient() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	uploadSem   = make(chan struct{}, 4)
+	downloadSem = make(chan struct{}, 4)
+	sshSem      = make(chan struct{}, 8)
+)
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+func initPostgres() error {
+	db, err := pgxpool.New(context.Background(), postgresURL)
 	if err != nil {
 		return err
 	}
-
-	err = client.Ping(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	mongoClient = client
-	log.Println("Conectado ao MongoDB com sucesso!")
+	dbPool = db
 	return nil
 }
 
 func main() {
-	// 1. Garantir que as pastas locais existem
-	for _, dir := range []string{localWatchDir, localOldDir, localTransDir} {
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			err := os.MkdirAll(dir, 0755)
-			if err != nil {
-				log.Fatalf("Erro ao criar diretório local %s: %v", dir, err)
-			}
-		}
+	folders := []string{localWatchDir, stage2Upload, stage3Gpu, stage4Download, localOldDir, localTransDir}
+	for _, d := range folders {
+		os.MkdirAll(d, 0755)
 	}
 
-	// 2. Inicializar MongoDB
-	err := initMongoClient()
-	if err != nil {
-		log.Printf("Aviso: Não foi possível conectar ao MongoDB (o fluxo continuará sem salvar no banco): %v", err)
-	}
+	_ = initPostgres()
 
-	// 3. Loop de Polling (Mais confiável para WSL2 /mnt/c)
-	log.Printf("Monitorando a pasta (polling): %s", localWatchDir)
-	processedFiles := make(map[string]bool)
+	log.Printf(">>> INICIANDO SISTEMA V15.0 (WORD-DRIVEN ENGINE) <<<")
 
+	go sourceProcessorService() // NOVO: Apenas move o MP3 original para upload
+	go uploaderService()
+	go gpuWatcherService()
+	go downloaderService()
+	go persisterService()
+
+	select {}
+}
+
+// V12.0: Elimina o Split local. Apenas prepara o MP3 original para o Uploader.
+func sourceProcessorService() {
 	for {
-		files, err := os.ReadDir(localWatchDir)
-		if err != nil {
-			log.Printf("Erro ao ler diretório: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
+		files, _ := os.ReadDir(localWatchDir)
 		for _, f := range files {
-			if f.IsDir() {
+			name := f.Name()
+			if f.IsDir() || !isAudio(name) {
+				continue
+			}
+			if _, busy := activeProcessing.Load("s1_" + name); busy {
 				continue
 			}
 
-			fileName := f.Name()
-			if !processedFiles[fileName] {
-				ext := strings.ToLower(filepath.Ext(fileName))
-
-				if ext == ".mp3" || ext == ".wav" || ext == ".m4a" {
-					fullPath := filepath.Join(localWatchDir, fileName)
-					log.Printf(">>> NOVO ÁUDIO DETECTADO: %s", fileName)
-
-					// Pequeno delay para garantir que o arquivo foi totalmente escrito
-					time.Sleep(1 * time.Second)
-
-					if handleNewFile(fullPath) {
-						processedFiles[fileName] = true
-						moveToOld(fullPath)
-					}
-				}
+			fullPath := filepath.Join(localWatchDir, name)
+			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+				continue
 			}
+
+			activeProcessing.Store("s1_"+name, true)
+			go func(fn string) {
+				defer activeProcessing.Delete("s1_" + fn)
+				base := strings.TrimSuffix(fn, filepath.Ext(fn))
+				recordTime(base, "start")
+
+				log.Printf("[Source] %s: Preparando fonte original para upload...", base)
+				// Movemos o MP3 original para a pasta de upload
+				dest := filepath.Join(stage2Upload, fn)
+				if err := os.Rename(filepath.Join(localWatchDir, fn), dest); err == nil {
+					recordTime(base, "split_done") // Marcamos split_done como o tempo de preparo
+					log.Printf("[Source] %s: OK", base)
+				}
+			}(name)
 		}
-
-		time.Sleep(3 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-func getSSHConfig() (*ssh.ClientConfig, error) {
-	key, err := os.ReadFile(remoteKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("não foi possível ler a chave privada: %v", err)
-	}
+func uploaderService() {
+	for {
+		files, _ := os.ReadDir(stage2Upload)
+		for _, f := range files {
+			name := f.Name() // ex: 764818206.mp3
+			if strings.HasSuffix(name, ".ready") {
+				continue
+			}
+			base := strings.TrimSuffix(name, filepath.Ext(name))
 
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("não foi possível parsear a chave privada: %v", err)
-	}
+			if _, busy := activeProcessing.Load("s2_" + base); busy {
+				continue
+			}
 
-	config := &ssh.ClientConfig{
-		User: remoteUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
-	}
+			activeProcessing.Store("s2_"+base, true)
+			go func(b, fn string) {
+				defer activeProcessing.Delete("s2_" + b)
 
-	return config, nil
-}
+				uploadSem <- struct{}{}
+				recordTime(b, "upload_start")
+				defer func() { <-uploadSem }()
 
-func handleNewFile(filePath string) bool {
-	fileName := filepath.Base(filePath)
-	log.Printf("[%s] Iniciando processamento...", fileName)
+				client, sftpC, err := connectSSH()
+				if err != nil {
+					log.Printf("[Uploader] ERRO SSH para %s: %v", b, err)
+					return
+				}
+				defer client.Close()
+				defer sftpC.Close()
 
-	// Extrair ID para o DB2 (ex: 851077886 do arquivo 851077886.mp3)
-	gravacaoID := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+				localPath := filepath.Join(stage2Upload, fn)
+				tempPath := remoteTempDir + "/" + fn
+				finalPath := remoteAudioDir + "/" + fn
 
-	config, err := getSSHConfig()
-	if err != nil {
-		log.Printf("[%s] Erro na config SSH: %v", fileName, err)
-		return false
-	}
+				log.Printf("[Uploader] %s: Transmitindo fonte original (%s)...", b, fn)
+				if err := uploadFile(sftpC, localPath, tempPath); err == nil {
+					sftpC.Rename(tempPath, finalPath)
+					recordTime(b, "upload_done")
 
-	// Conectar ao servidor
-	client, err := ssh.Dial("tcp", remoteHost+":22", config)
-	if err != nil {
-		log.Printf("[%s] Erro ao conectar no servidor: %v", fileName, err)
-		return false
-	}
-	defer client.Close()
-
-	sftpClient, err := sftp.NewClient(client)
-	if err != nil {
-		log.Printf("[%s] Erro ao criar cliente SFTP: %v", fileName, err)
-		return false
-	}
-	defer sftpClient.Close()
-
-	// 1. Enviar arquivo via SFTP
-	remoteAudioPath := filepath.Join(remoteAudioDir, fileName)
-	remoteAudioPath = strings.ReplaceAll(remoteAudioPath, "\\", "/")
-	err = uploadFile(sftpClient, filePath, remoteAudioPath)
-	if err != nil {
-		log.Printf("[%s] Erro no upload: %v", fileName, err)
-		return false
-	}
-
-	// 2. Executar script remoto
-	err = runRemoteScript(client)
-	if err != nil {
-		log.Printf("[%s] Erro ao executar script remoto: %v", fileName, err)
-		return false
-	}
-
-	// 3. Baixar transcrição
-	transFileName := fileName + ".txt"
-	remoteTransPath := filepath.Join(remoteTransDir, transFileName)
-	remoteTransPath = strings.ReplaceAll(remoteTransPath, "\\", "/")
-	localTransPath := filepath.Join(localTransDir, transFileName)
-
-	err = downloadFile(sftpClient, remoteTransPath, localTransPath)
-	if err != nil {
-		log.Printf("[%s] Erro ao baixar transcrição: %v", fileName, err)
-		return false
-	}
-
-	// 4. Buscar Metadados no DB2 (Local via Python Bridge)
-	log.Printf("[%s] Buscando metadados no DB2...", fileName)
-	metadata := fetchDB2Metadata(gravacaoID)
-
-	// 5. Salvar no MongoDB
-	content, err := os.ReadFile(localTransPath)
-	if err == nil {
-		err = saveToMongo(fileName, string(content), localTransPath, metadata)
-		if err != nil {
-			log.Printf("[%s] Erro ao salvar no MongoDB: %v", fileName, err)
-		} else {
-			log.Printf("[%s] Transcrição salva no MongoDB com sucesso.", fileName)
+					// Criamos o marcador .ready para o GPUWatcher
+					os.WriteFile(filepath.Join(stage2Upload, b+".ready"), []byte(time.Now().String()), 0644)
+					os.Rename(localPath, filepath.Join(localOldDir, fn))
+					log.Printf("[Uploader] %s: OK", b)
+				} else {
+					log.Printf("[Uploader] ERRO no arquivo %s: %v", fn, err)
+				}
+			}(base, name)
 		}
-	} else {
-		log.Printf("[%s] Erro ao ler transcrição baixada para salvar no banco: %v", fileName, err)
+		time.Sleep(1 * time.Second)
 	}
-
-	// 6. Limpar servidor
-	log.Printf("[%s] Limpando arquivos no servidor...", fileName)
-	sftpClient.Remove(remoteAudioPath)
-	sftpClient.Remove(remoteTransPath)
-
-	log.Printf("[%s] Processamento concluído com sucesso!", fileName)
-	return true
 }
 
-func fetchDB2Metadata(gravacaoID string) map[string]interface{} {
-	cmd := exec.Command("python3", "fetch_db2.py", gravacaoID)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Aviso: Erro ao buscar no DB2 (Python): %v - %s", err, string(out))
-		return nil
-	}
+func gpuWatcherService() {
+	for {
+		files, _ := os.ReadDir(stage2Upload)
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), ".ready") {
+				continue
+			}
+			base := strings.TrimSuffix(f.Name(), ".ready")
+			if _, busy := activeProcessing.Load("s3_" + base); busy {
+				continue
+			}
 
-	var meta map[string]interface{}
-	err = json.Unmarshal(out, &meta)
-	if err != nil {
-		log.Printf("Aviso: Erro ao decodificar JSON do DB2: %v", err)
-		return nil
-	}
+			activeProcessing.Store("s3_"+base, true)
+			go func(b string, marker string) {
+				defer activeProcessing.Delete("s3_" + b)
 
-	return meta
+				client, sftpC, err := connectSSH()
+				if err != nil {
+					return
+				}
+				defer client.Close()
+				defer sftpC.Close()
+
+				// V12.2: O Python agora gera arquivos .wav.json após o split purista
+				jsonA := remoteTransDir + "/" + b + "_atendente.wav.json"
+				jsonC := remoteTransDir + "/" + b + "_cliente.wav.json"
+				activeA := remoteTransDir + "/" + b + "_atendente.wav.active"
+				activeC := remoteTransDir + "/" + b + "_cliente.wav.active"
+
+				startedActive := false
+				for {
+					if !startedActive {
+						_, errA := sftpC.Stat(activeA)
+						_, errC := sftpC.Stat(activeC)
+						if errA == nil || errC == nil {
+							recordTime(b, "gpu_start_real")
+							startedActive = true
+							log.Printf("[GPUWatcher] %s: Ativo na GPU (Split Remoto + IA)", b)
+						}
+					}
+
+					_, errA := sftpC.Stat(jsonA)
+					_, errC := sftpC.Stat(jsonC)
+					if errA == nil && errC == nil {
+						break
+					}
+					time.Sleep(3 * time.Second)
+				}
+
+				if !startedActive {
+					recordTime(b, "gpu_start_real")
+				}
+				recordTime(b, "gpu_done")
+				os.WriteFile(filepath.Join(stage3Gpu, b+".ready"), []byte(time.Now().String()), 0644)
+				os.Remove(marker)
+				log.Printf("[GPUWatcher] %s: Concluído", b)
+			}(base, filepath.Join(stage2Upload, f.Name()))
+		}
+		time.Sleep(1 * time.Second)
+	}
 }
 
-func saveToMongo(fileName, content, audioPath string, metadata map[string]interface{}) error {
-	if mongoClient == nil {
-		return fmt.Errorf("cliente MongoDB não inicializado")
+func downloaderService() {
+	for {
+		files, _ := os.ReadDir(stage3Gpu)
+		for _, f := range files {
+			base := strings.TrimSuffix(f.Name(), ".ready")
+			if _, busy := activeProcessing.Load("s4_" + base); busy {
+				continue
+			}
+
+			activeProcessing.Store("s4_"+base, true)
+			go func(b string, marker string) {
+				defer activeProcessing.Delete("s4_" + b)
+				downloadSem <- struct{}{}
+				defer func() { <-downloadSem }()
+
+				client, sftpC, err := connectSSH()
+				if err != nil {
+					return
+				}
+				defer client.Close()
+				defer sftpC.Close()
+
+				locA := filepath.Join(stage4Download, b+"_atendente.wav.json")
+				locC := filepath.Join(stage4Download, b+"_cliente.wav.json")
+
+				_ = downloadFile(sftpC, remoteTransDir+"/"+b+"_atendente.wav.json", locA)
+				_ = downloadFile(sftpC, remoteTransDir+"/"+b+"_cliente.wav.json", locC)
+
+				// Limpeza V12.2: remove os arquivos de áudio originais e os JSONs WAV
+				sftpC.Remove(remoteAudioDir + "/" + b + ".mp3")
+				sftpC.Remove(remoteAudioDir + "/" + b + ".wav")
+				sftpC.Remove(remoteTransDir + "/" + b + "_atendente.wav.json")
+				sftpC.Remove(remoteTransDir + "/" + b + "_cliente.wav.json")
+
+				recordTime(b, "download_done")
+				os.WriteFile(filepath.Join(stage4Download, b+".ready"), []byte(time.Now().String()), 0644)
+				os.Remove(marker)
+				log.Printf("[Downloader] %s: OK", b)
+			}(base, filepath.Join(stage3Gpu, f.Name()))
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-
-	collection := mongoClient.Database(mongoDB).Collection(mongoColl)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	doc := TranscriptionDoc{
-		FileName:    fileName,
-		Content:     content,
-		ProcessedAt: time.Now(),
-		AudioPath:   audioPath,
-		Metadata:    metadata,
-	}
-
-	_, err := collection.InsertOne(ctx, doc)
-	return err
 }
 
-func moveToOld(filePath string) {
-	fileName := filepath.Base(filePath)
-	destPath := filepath.Join(localOldDir, fileName)
+func persisterService() {
+	for {
+		files, _ := os.ReadDir(stage4Download)
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), ".ready") {
+				continue
+			}
+			base := strings.TrimSuffix(f.Name(), ".ready")
+			if _, busy := activeProcessing.Load("s5_" + base); busy {
+				continue
+			}
 
-	err := os.Rename(filePath, destPath)
-	if err != nil {
-		log.Printf("Erro ao mover arquivo para audios_old: %v", err)
+			activeProcessing.Store("s5_"+base, true)
+			go func(b string, marker string) {
+				defer activeProcessing.Delete("s5_" + b)
+				jsA := filepath.Join(stage4Download, b+"_atendente.wav.json")
+				jsC := filepath.Join(stage4Download, b+"_cliente.wav.json")
+
+				segA := loadSegments(jsA, "Atendente")
+				segC := loadSegments(jsC, "Cliente")
+				all := append(segA, segC...)
+				sort.SliceStable(all, func(i, j int) bool { return all[i].Start < all[j].Start })
+
+				var sb strings.Builder
+				for _, s := range all {
+					m, sec := divmod(int(s.Start), 60)
+					sb.WriteString(fmt.Sprintf("[%02d:%02d] %s: %s\n", m, sec, s.Speaker, s.Text))
+				}
+				content := sb.String()
+				_ = saveToPostgres(b, content, fetchDB2Metadata(b))
+				showFinalReport(b)
+				os.Remove(jsA)
+				os.Remove(jsC)
+				os.Remove(marker)
+			}(base, filepath.Join(stage4Download, f.Name()))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func recordTime(base, event string) {
+	m, _ := fileTimestamps.LoadOrStore(base, make(map[string]time.Time))
+	m.(map[string]time.Time)[event] = time.Now()
+}
+
+func showFinalReport(base string) {
+	val, ok := fileTimestamps.Load(base)
+	if !ok {
 		return
 	}
-	log.Printf("Arquivo movido localmente para: %s", destPath)
+	t := val.(map[string]time.Time)
+
+	total := time.Since(t["start"])
+	upActive := t["upload_done"].Sub(t["upload_start"])
+	srvQueue := t["gpu_start_real"].Sub(t["upload_done"])
+	if srvQueue < 0 {
+		srvQueue = 0
+	}
+	gpuActive := t["gpu_done"].Sub(t["gpu_start_real"])
+	down := t["download_done"].Sub(t["gpu_done"])
+
+	log.Printf("[V15.0] %s: TOTAL:%s | Up:%s | Q:%s | GPU:%s | D:%s",
+		base, total.Round(time.Second),
+		upActive.Round(time.Second), srvQueue.Round(time.Second),
+		gpuActive.Round(time.Second), down.Round(time.Second))
 }
 
-func uploadFile(sftpClient *sftp.Client, localPath, remotePath string) error {
-	srcFile, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("erro ao abrir arquivo local: %v", err)
-	}
-	defer srcFile.Close()
-
-	dstFile, err := sftpClient.Create(remotePath)
-	if err != nil {
-		return fmt.Errorf("erro ao criar arquivo remoto: %v", err)
-	}
-	defer dstFile.Close()
-
-	_, err = io.Copy(dstFile, srcFile)
-	if err != nil {
-		return fmt.Errorf("erro ao copiar conteúdo: %v", err)
-	}
-
-	log.Printf("Arquivo enviado: %s", remotePath)
-	return nil
+func isAudio(n string) bool {
+	e := strings.ToLower(filepath.Ext(n))
+	return e == ".mp3" || e == ".wav" || e == ".m4a"
 }
-
-func downloadFile(sftpClient *sftp.Client, remotePath, localPath string) error {
-	srcFile, err := sftpClient.Open(remotePath)
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+func connectSSH() (*ssh.Client, *sftp.Client, error) {
+	sshSem <- struct{}{}
+	defer func() { <-sshSem }()
+	key, _ := os.ReadFile(remoteKeyPath)
+	signer, _ := ssh.ParsePrivateKey(key)
+	conf := &ssh.ClientConfig{User: remoteUser, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 20 * time.Second}
+	c, err := ssh.Dial("tcp", remoteHost+":22", conf)
 	if err != nil {
-		return fmt.Errorf("erro ao abrir arquivo remoto: %v", err)
+		return nil, nil, err
 	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("erro ao criar arquivo local: %v", err)
-	}
-	defer dstFile.Close()
-
-	_, err = io.Copy(dstFile, srcFile)
-	if err != nil {
-		return fmt.Errorf("erro ao copiar conteúdo: %v", err)
-	}
-
-	log.Printf("Transcrição baixada para: %s", localPath)
-	return nil
+	s, err := sftp.NewClient(c)
+	return c, s, err
 }
-
-func runRemoteScript(sshClient *ssh.Client) error {
-	session, err := sshClient.NewSession()
-	if err != nil {
-		return fmt.Errorf("erro ao criar sessão SSH: %v", err)
-	}
-	defer session.Close()
-
-	fullCommand := fmt.Sprintf("cd %s && %s", remoteWorkDir, remoteScript)
-	log.Printf("Executando no servidor: %s", fullCommand)
-
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	err = session.Run(fullCommand)
-	if err != nil {
-		return fmt.Errorf("erro ao executar comando: %v", err)
-	}
-
-	return nil
+func uploadFile(s *sftp.Client, l, r string) error {
+	f, _ := os.Open(l)
+	defer f.Close()
+	d, _ := s.Create(r)
+	defer d.Close()
+	_, err := io.Copy(d, f)
+	return err
 }
+func downloadFile(s *sftp.Client, r, l string) error {
+	f, err := s.Open(r)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	d, _ := os.Create(l)
+	defer d.Close()
+	_, err = io.Copy(d, f)
+	return err
+}
+func loadSegments(p, sp string) []Segment {
+	d, _ := os.ReadFile(p)
+	var s []Segment
+	json.Unmarshal(d, &s)
+	for i := range s {
+		s[i].Speaker = sp
+	}
+	return s
+}
+func fetchDB2Metadata(id string) map[string]interface{} {
+	o, _ := exec.Command("python3", "fetch_db2.py", id).CombinedOutput()
+	var m map[string]interface{}
+	json.Unmarshal(o, &m)
+	return m
+}
+func saveToPostgres(base, content string, meta map[string]interface{}) error {
+	if dbPool == nil {
+		return nil
+	}
+	m, _ := json.Marshal(meta)
+	_, err := dbPool.Exec(context.Background(), "INSERT INTO transcriptions (file_name, content, processed_at, metadata) VALUES ($1, $2, $3, $4)", base, content, time.Now(), m)
+	return err
+}
+func divmod(n, d int) (q, r int) { q = n / d; r = n % d; return }
