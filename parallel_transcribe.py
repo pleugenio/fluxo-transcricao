@@ -1,209 +1,256 @@
 import os
 import json
 import time
-import queue
 import threading
-import sys
 import subprocess
+import sys
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from faster_whisper import WhisperModel
-from concurrent.futures import ThreadPoolExecutor
 
 # ==============================
-# CONFIGURAÇÃO V15.0 (WORD-DRIVEN ENGINE)
+# CONFIGURAÇÃO V16.1 (ANTI-HALLUCINATION)
 # ==============================
+
 MODEL_SIZE = "large-v3"
 DEVICE = "cuda"
-COMPUTE_TYPE = "float16" 
-NUM_WORKERS = 2 
+COMPUTE_TYPE = "int8_float16"
+NUM_WORKERS = 2  # Processa atendente e cliente em paralelo
 
-# Prompt Curto e Objetivo (Evita desvios)
-INITIAL_PROMPT = "Transcrição precisa. Luciano, LBV, trinta reais, Olito Meira."
-
-# Pastas no Servidor
-AUDIO_FOLDER = "./audios"      # Fonte original (MP3/M4A)
+AUDIO_FOLDER = "./audios"
 OUTPUT_FOLDER = "./transcricoes"
 TEMP_SPLIT_FOLDER = "./temp_split"
 
-os.makedirs(AUDIO_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(TEMP_SPLIT_FOLDER, exist_ok=True)
 
+# ==============================
+# CONTEXTO INSTITUCIONAL
+# ==============================
+
+prompt_contexto = """
+Transcrição de telemarketing da Legião da Boa Vontade (LBV).
+
+Palavras importantes:
+LBV
+Legião da Boa Vontade
+DDD
+CPF
+plano pós-pago
+adesão à doação mensal
+contribuição mensal
+"""
+
+# ==============================
+# CARREGAMENTO DO MODELO
+# ==============================
+
+print("--- INICIANDO WHISPER SERVICE V16.1 (ANTI-HALLUCINATION) ---")
+print("Carregando modelo na GPU...")
+sys.stdout.flush()
+
+model = WhisperModel(
+    MODEL_SIZE,
+    device=DEVICE,
+    compute_type=COMPUTE_TYPE
+)
+print("Modelo carregado.\n")
+sys.stdout.flush()
+
+# Lock para acesso ao modelo (NUM_WORKERS=2 mas modelo=1, então serializamos)
+model_lock = threading.Lock()
+
+# Controle de processamento em andamento
 in_progress = set()
 in_progress_lock = threading.Lock()
 
 # ==============================
-# POOL DE MODELOS
+# SPLIT ESTÉREO (FFmpeg)
 # ==============================
-print(f"--- INICIANDO WHISPER SERVICE V15.0 (WORD-DRIVEN ENGINE) ---")
-print(f"Carregando {NUM_WORKERS} instâncias na GPU...")
-sys.stdout.flush()
 
-model_pool = queue.Queue()
-try:
-    for i in range(NUM_WORKERS):
-        print(f"Carregando instância {i+1}...")
-        m = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-        model_pool.put(m)
-    print("Pronto para processar.\n")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"ERRO CRÍTICO NO CARREGAMENTO: {e}")
-    sys.stdout.flush()
-    exit(1)
-
-def run_remote_split(input_path, base_name):
-    """V13.4: Split Robusto (Foco no Início do Áudio)"""
+def split_stereo(input_path, base_name):
+    """Separa canal esquerdo (atendente) e direito (cliente) do áudio estéreo."""
     at_path = os.path.join(TEMP_SPLIT_FOLDER, f"{base_name}_atendente.wav")
     cl_path = os.path.join(TEMP_SPLIT_FOLDER, f"{base_name}_cliente.wav")
-    
-    # Simplificado: Extrai canais puristas sem filtros que possam dar "skip" no início
+
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-filter_complex", "[0:a]pan=mono|c0=c0[at];[0:a]pan=mono|c0=c1[cl]",
         "-map", "[at]", "-ac", "1", "-ar", "16000", at_path,
         "-map", "[cl]", "-ac", "1", "-ar", "16000", cl_path
     ]
-    
+
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return at_path, cl_path
-    except Exception as e:
-        print(f"ERRO NO SPLIT MINIMALISTA ({base_name}): {e}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERRO FFmpeg ({base_name}): {e.stderr.decode()}")
         return None, None
 
-def transcribe_audio(audio_path, speaker_label):
-    fn = os.path.basename(audio_path)
-    active_marker = os.path.join(OUTPUT_FOLDER, fn + ".active")
-    
-    current_model = model_pool.get()
-    with open(active_marker, "w") as f:
-        f.write(str(time.time()))
+# ==============================
+# FUNÇÃO DE TRANSCRIÇÃO
+# ==============================
 
-    print(f"-> Transcrevendo {speaker_label}: {fn}")
+def transcrever(audio_path, speaker_label):
+    """Transcreve um canal de áudio e retorna lista de segmentos com timestamps."""
+    print(f"-> Transcrevendo {speaker_label}: {os.path.basename(audio_path)}")
     sys.stdout.flush()
-    
-    try:
-        # V15.0: Transmissão por Palavra (O fim dos blocos gigantes)
-        segments, info = current_model.transcribe(
-            audio_path,
-            beam_size=10, 
-            word_timestamps=True,
-            initial_prompt=INITIAL_PROMPT,
-            language="pt",
-            condition_on_previous_text=False, # Evita que a IA "se perca" no tempo
-            temperature=0, 
-            compression_ratio_threshold=2.2,
-            no_speech_threshold=0.5, 
-            log_prob_threshold=-1.0
-        )
-        
-        all_words = []
-        for s in list(segments):
-            if s.words:
-                all_words.extend(s.words)
-        
-        results = []
-        if not all_words:
-            return results # Áudio vazio ou apenas ruído
-            
-        # RECONSTRUÇÃO CIRÚRGICA:
-        # Agrupamos palavras em linhas apenas se o gap for menor que 0.3s
-        current_segment_words = [all_words[0]]
-        start_time = all_words[0].start
-        
-        for i in range(1, len(all_words)):
-            w_prev = all_words[i-1]
-            w_curr = all_words[i]
-            
-            gap = w_curr.start - w_prev.end
-            # Gap de 0.3s ou mudança brusca = NOVA LINHA
-            if gap > 0.3:
-                results.append({
-                    "start": round(start_time, 3),
-                    "end": round(w_prev.end, 3),
-                    "text": " ".join([x.word.strip() for x in current_segment_words]).strip()
-                })
-                current_segment_words = [w_curr]
-                start_time = w_curr.start
-            else:
-                current_segment_words.append(w_curr)
-        
-        # Adiciona a última parte
-        if current_segment_words:
-            results.append({
-                "start": round(start_time, 3),
-                "end": round(current_segment_words[-1].end, 3),
-                "text": " ".join([x.word.strip() for x in current_segment_words]).strip()
-            })
-            
-        return results
-    finally:
-        if os.path.exists(active_marker): os.remove(active_marker)
-        model_pool.put(current_model)
 
-def process_source_file(input_path):
+    start = time.time()
+
+    with model_lock:
+        segments, info = model.transcribe(
+            audio_path,
+            beam_size=5,
+            temperature=0,
+            initial_prompt=prompt_contexto,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 800},
+            word_timestamps=True,
+            condition_on_previous_text=True,
+            language="pt",
+            # Anti-alucinação:
+            compression_ratio_threshold=1.8,  # "nao nao nao" tem razão > 1.8 → descarta
+            log_prob_threshold=-0.5,           # Rejeita transcrições de baixa confiança
+            no_speech_threshold=0.6            # Mais agressivo na detecção de silêncio
+        )
+        # Materializa o gerador enquanto o lock está ativo
+        segments = list(segments)
+
+    elapsed = time.time() - start
+    print(f"   {speaker_label} concluído em {round(elapsed, 1)}s (RTF: {round(elapsed/info.duration, 3)})") 
+    sys.stdout.flush()
+
+    # Reconstrói segmentos a partir dos timestamps de palavras
+    # Um silêncio > 0.5s entre palavras cria uma nova linha
+    results = []
+    all_words = []
+    for s in segments:
+        if s.words:
+            all_words.extend(s.words)
+
+    if not all_words:
+        return results
+
+    GAP_THRESHOLD = 1.0  # segundos de silêncio para quebrar uma linha
+
+    current_words = [all_words[0]]
+    seg_start = all_words[0].start
+
+    for i in range(1, len(all_words)):
+        prev = all_words[i - 1]
+        curr = all_words[i]
+        gap = curr.start - prev.end
+
+        if gap > GAP_THRESHOLD:
+            text = " ".join(w.word.strip() for w in current_words).strip()
+            if text:
+                results.append({
+                    "start": round(seg_start, 3),
+                    "end": round(prev.end, 3),
+                    "text": text
+                })
+            current_words = [curr]
+            seg_start = curr.start
+        else:
+            current_words.append(curr)
+
+    # Último segmento
+    if current_words:
+        text = " ".join(w.word.strip() for w in current_words).strip()
+        if text:
+            results.append({
+                "start": round(seg_start, 3),
+                "end": round(current_words[-1].end, 3),
+                "text": text
+            })
+
+    return results
+
+# ==============================
+# PROCESSAMENTO DE ARQUIVO
+# ==============================
+
+def process_file(input_path):
     fn = os.path.basename(input_path)
     base = os.path.splitext(fn)[0]
-    
-    print(f"-> Processando fonte: {fn}")
+
+    print(f"\n[>] Processando: {fn}")
     sys.stdout.flush()
-    start_time = time.time()
-    
-    # 1. SPLIT LOCAL NO SERVIDOR (Gerando WAVs)
-    at_file, cl_file = run_remote_split(input_path, base)
+    t0 = time.time()
+
+    # 1. Split estéreo
+    at_file, cl_file = split_stereo(input_path, base)
     if not at_file or not cl_file:
-        with in_progress_lock: in_progress.remove(fn)
+        with in_progress_lock:
+            in_progress.discard(fn)
         return
 
-    # 2. TRANSCRIÇÃO DOS CANAIS PURISTAS (WAV)
-    res_at = transcribe_audio(at_file, "Atendente")
-    res_cl = transcribe_audio(cl_file, "Cliente")
+    # 2. Transcrição paralela dos dois canais
+    res_at = []
+    res_cl = []
 
-    # 3. SALVAR JSONS (Formatos de nome compatíveis com o Go)
-    # Nota: O Go espera base_atendente.wav.json ou base_atendente.ogg.json
-    # Vamos manter o sufixo original do áudio gerado para evitar confusão no Downloader
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_at = ex.submit(transcrever, at_file, "Atendente")
+        fut_cl = ex.submit(transcrever, cl_file, "Cliente")
+        res_at = fut_at.result()
+        res_cl = fut_cl.result()
+
+    # 3. Salva JSONs
     with open(os.path.join(OUTPUT_FOLDER, f"{base}_atendente.wav.json"), "w", encoding="utf-8") as f:
         json.dump(res_at, f, ensure_ascii=False, indent=2)
     with open(os.path.join(OUTPUT_FOLDER, f"{base}_cliente.wav.json"), "w", encoding="utf-8") as f:
         json.dump(res_cl, f, ensure_ascii=False, indent=2)
 
-    # V15.1: MODO DEPURAÇÃO - Não apagar os splits para análise do usuário
-    # if os.path.exists(at_file): os.remove(at_file)
-    # if os.path.exists(cl_file): os.remove(cl_file)
-    
-    dur = round(time.time() - start_time, 2)
-    print(f"<- Concluído: {fn} (Total Server: {dur}s)")
-    sys.stdout.flush()
-    
-    with in_progress_lock:
-        in_progress.remove(fn)
+    # MODO DEBUG - Mantém os splits temporários para análise
+    # for p in [at_file, cl_file]:
+    #     if os.path.exists(p):
+    #         os.remove(p)
 
-def main_service_loop():
-    print(f"Monitorando {AUDIO_FOLDER} por arquivos MP3/M4A originais...")
+    elapsed = round(time.time() - t0, 2)
+    print(f"[<] Concluído: {fn} em {elapsed}s total")
     sys.stdout.flush()
+
+    with in_progress_lock:
+        in_progress.discard(fn)
+
+# ==============================
+# LOOP PRINCIPAL (WATCH FOLDER)
+# ==============================
+
+def main():
+    print(f"Monitorando {AUDIO_FOLDER} por arquivos de áudio...")
+    sys.stdout.flush()
+
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         while True:
             try:
-                all_files = [f for f in os.listdir(AUDIO_FOLDER) if f.lower().endswith((".mp3", ".m4a", ".wav"))]
-                
+                all_files = [
+                    f for f in os.listdir(AUDIO_FOLDER)
+                    if f.lower().endswith((".mp3", ".m4a", ".wav"))
+                ]
+
                 for f in sorted(all_files):
                     base = os.path.splitext(f)[0]
-                    # Verifica se já processou
-                    if os.path.exists(os.path.join(OUTPUT_FOLDER, f"{base}_atendente.wav.json")):
-                        continue
+                    out_json = os.path.join(OUTPUT_FOLDER, f"{base}_atendente.wav.json")
+
+                    if os.path.exists(out_json):
+                        continue  # Já processado
 
                     with in_progress_lock:
-                        if f in in_progress: continue
+                        if f in in_progress:
+                            continue
                         path = os.path.join(AUDIO_FOLDER, f)
                         if os.path.exists(path) and os.path.getsize(path) > 1000:
                             in_progress.add(f)
-                            executor.submit(process_source_file, path)
-                
+                            executor.submit(process_file, path)
+
                 time.sleep(1)
+
             except Exception as e:
-                print(f"Erro Loop: {e}")
+                print(f"Erro no loop: {e}")
                 sys.stdout.flush()
                 time.sleep(2)
 
 if __name__ == "__main__":
-    main_service_loop()
+    main()

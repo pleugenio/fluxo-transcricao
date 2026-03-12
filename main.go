@@ -71,7 +71,7 @@ func main() {
 
 	_ = initPostgres()
 
-	log.Printf(">>> INICIANDO SISTEMA V15.0 (WORD-DRIVEN ENGINE) <<<")
+	log.Printf(">>> INICIANDO SISTEMA V16.1 (ANTI-HALLUCINATION) <<<")
 
 	go sourceProcessorService() // NOVO: Apenas move o MP3 original para upload
 	go uploaderService()
@@ -338,7 +338,7 @@ func showFinalReport(base string) {
 	gpuActive := t["gpu_done"].Sub(t["gpu_start_real"])
 	down := t["download_done"].Sub(t["gpu_done"])
 
-	log.Printf("[V15.0] %s: TOTAL:%s | Up:%s | Q:%s | GPU:%s | D:%s",
+	log.Printf("[V16.1] %s: TOTAL:%s | Up:%s | Q:%s | GPU:%s | D:%s",
 		base, total.Round(time.Second),
 		upActive.Round(time.Second), srvQueue.Round(time.Second),
 		gpuActive.Round(time.Second), down.Round(time.Second))
