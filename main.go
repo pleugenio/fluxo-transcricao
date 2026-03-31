@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	localWatchDir  = "./audios"
+	localWatchDir  = "C:/Audios"
 	stage2Upload   = "./temp/2_upload"
 	stage3Gpu      = "./temp/3_gpu"
 	stage4Download = "./temp/4_done"
@@ -80,6 +81,64 @@ var (
 	sshSem      = make(chan struct{}, 8)
 )
 
+
+// Dicionário de correções baseadas em análise de 34 transcrições reais
+// IMPORTANTE: Apenas erros sistemáticos que NÃO alteram significado
+var correctionDict = map[string]string{
+	// Nome da instituição (7 ocorrências encontradas)
+	"LBZ": "LBV",
+	"LBB": "LBV",
+
+	// Espaços em valores monetários (sistemático)
+	"R $ ":   "R$ ",
+	" ,00":   ",00",
+	" ,50":   ",50",
+	" ,25":   ",25",
+	" ,75":   ",75",
+
+	// Hífens com espaços (5+ ocorrências)
+	"bem -vindo":   "bem-vindo",
+	"pós -pago":    "pós-pago",
+	"pós - pago":   "pós-pago",
+	"e -mail":      "e-mail",
+
+	// Separadores de milhares
+	"1 .500": "1.500",
+
+	// ═══ NOVOS PADRÕES CONFIRMADOS 3+ VEZES ═══
+	// Fusão OCR de palavras (desona = des + ona, etc)
+	"desonadoação":   "a doação",
+	"desuma doação":  "a doação",
+
+	// Domínios com espaço antes de ponto (3+ ocorrências)
+	".org .br":      ".org.br",
+	"pixi .org .br": "pixi.org.br",
+	"lbv .org .br":  "lbv.org.br",
+
+	// Tratamento (Dana não existe em português, é erro de transcrição)
+	"Dana ":  "Dona ",
+	"Dana,":  "Dona,",
+	"Dana.":  "Dona.",
+	"Dana?":  "Dona?",
+
+	// Telefone/CPF com espaço antes de hífen (3+ ocorrências)
+	// Nota: padrão regex aplicado separadamente
+}
+
+func correctText(text string) string {
+	// Aplica correções do dicionário
+	for wrong, right := range correctionDict {
+		text = strings.ReplaceAll(text, wrong, right)
+	}
+
+	// Regex: Remove espaço antes de hífen em numeração (CPF, telefone, etc)
+	// Padrão: "número -número" → "número-número" (3+ ocorrências confirmadas)
+	reHyphen := regexp.MustCompile(`(\d)\s+-(\d)`)
+	text = reHyphen.ReplaceAllString(text, "$1-$2")
+
+	return text
+}
+
 func initPostgres() error {
 	db, err := pgxpool.New(context.Background(), postgresURL)
 	if err != nil {
@@ -102,6 +161,8 @@ func runMigrations() {
 		// Corrige colunas criadas previamente com precisão menor (2 → 4 decimais)
 		`ALTER TABLE transcricoes ALTER COLUMN ch0_rms TYPE NUMERIC(8,4)`,
 		`ALTER TABLE transcricoes ALTER COLUMN ch1_rms TYPE NUMERIC(8,4)`,
+		// Adiciona coluna para transcrição corrigida
+		`ALTER TABLE transcricoes ADD COLUMN IF NOT EXISTS transcricao_corrigida TEXT`,
 	}
 	for _, sql := range migrations {
 		if _, err := dbPool.Exec(context.Background(), sql); err != nil {
@@ -112,6 +173,22 @@ func runMigrations() {
 }
 
 func main() {
+	// Comando para limpar a tabela: go run main.go clean
+	if len(os.Args) > 1 && os.Args[1] == "clean" {
+		if err := initPostgres(); err != nil {
+			log.Fatal(err)
+		}
+		result, err := dbPool.Exec(context.Background(), "DELETE FROM transcricoes")
+		if err != nil {
+			log.Fatalf("Erro ao deletar: %v\n", err)
+		}
+		log.Printf("✓ %d registros deletados\n", result.RowsAffected())
+		var count int64
+		dbPool.QueryRow(context.Background(), "SELECT COUNT(*) FROM transcricoes").Scan(&count)
+		log.Printf("✓ Tabela agora tem %d registros\n", count)
+		return
+	}
+
 	folders := []string{localWatchDir, stage2Upload, stage3Gpu, stage4Download, localOldDir, localTransDir}
 	for _, d := range folders {
 		os.MkdirAll(d, 0755)
@@ -456,7 +533,13 @@ func persisterService() {
 				log.Printf("[Persister] %s: %d turnos | %.1fs | SNR=%.1fdB | silêncio=%.0f%% | dropouts=%d | clipping=%.3f%% | enhanced=%v | pessoa=%s",
 					b, totalTurnos, duracao, quality.SnrDb, quality.SilenceRatio*100, quality.DropoutCount, quality.ClippingRatio*100, quality.AudioEnhanced, meta.NmePessoa)
 
-				if err := saveToPostgres(b, txtContent, timelineJSON, atJSON, clJSON,
+				// Aplicar correções de erros comuns de transcrição
+				// NÃO aplicar correções automáticas - manter transcrição original fiel
+
+			// Gerar versão corrigida
+				txtCorrected := correctText(txtContent)
+
+				if err := saveToPostgres(b, txtContent, txtCorrected, timelineJSON, atJSON, clJSON,
 					totalTurnos, duracao, meta, quality); err != nil {
 					log.Printf("[Persister] ERRO PostgreSQL para %s: %v", b, err)
 				} else {
@@ -604,11 +687,41 @@ func fetchDB2Metadata(id string) DB2Meta {
 		}
 		return m
 	}
-	log.Printf("[DB2] Python não encontrado ou fetch_db2.py inacessível para %s.", id)
-	return DB2Meta{}
+	// Fallback: tentar via SSH na VM (onde Python e ibm_db podem estar instalados)
+	log.Printf("[DB2] Python local falhou para %s, tentando via SSH na VM...", id)
+	sshClient, sftpClient, err := connectSSH()
+	if err != nil {
+		log.Printf("[DB2] SSH falhou para %s: %v", id, err)
+		return DB2Meta{}
+	}
+	defer sshClient.Close()
+	defer sftpClient.Close()
+
+	// Executar fetch_db2.py na VM via SSH
+	session, err := sshClient.NewSession()
+	if err != nil {
+		log.Printf("[DB2] SSH session falhou para %s: %v", id, err)
+		return DB2Meta{}
+	}
+	defer session.Close()
+
+	o, err := session.CombinedOutput(fmt.Sprintf("python3 /home/speaksense/whisper-gpu-test-paralel/fetch_db2.py %s", id))
+	if err != nil {
+		log.Printf("[DB2] SSH exec falhou para %s: %v | output: %s", id, err, string(o))
+		return DB2Meta{}
+	}
+
+	var m DB2Meta
+	if err := json.Unmarshal(o, &m); err != nil {
+		log.Printf("[DB2] ERRO JSON via SSH para %s: %v | output: %s", id, err, string(o))
+		return DB2Meta{}
+	}
+
+	log.Printf("[DB2] Metadados obtidos via SSH para %s", id)
+	return m
 }
 
-func saveToPostgres(base, txtContent string, timelineJSON, atJSON, clJSON []byte,
+func saveToPostgres(base, txtContent, txtCorrected string, timelineJSON, atJSON, clJSON []byte,
 	totalTurnos int, duracao float64, meta DB2Meta, quality AudioQuality) error {
 
 	if dbPool == nil {
@@ -620,7 +733,7 @@ func saveToPostgres(base, txtContent string, timelineJSON, atJSON, clJSON []byte
 	_, err := dbPool.Exec(context.Background(), `
 		INSERT INTO transcricoes (
 			gravacao_id, processado_em,
-			transcricao_txt, timeline_json, atendente_json, cliente_json,
+			transcricao_txt, transcricao_corrigida, timeline_json, atendente_json, cliente_json,
 			total_turnos, turnos_atendente, turnos_cliente, duracao_segundos,
 			snr_db, silence_ratio, clipping_ratio, dropout_count, ch0_rms, ch1_rms,
 			audio_enhanced, diarizer,
@@ -629,18 +742,19 @@ func saveToPostgres(base, txtContent string, timelineJSON, atJSON, clJSON []byte
 			dsc_campanha, db2_metadata_json
 		) VALUES (
 			$1, $2,
-			$3, $4, $5, $6,
-			$7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16,
-			$17, $18,
-			$19, $20, $21, $22,
-			$23, $24, $25, $26,
-			$27, $28
+			$3, $4, $5, $6, $7,
+			$8, $9, $10, $11,
+			$12, $13, $14, $15, $16, $17,
+			$18, $19,
+			$20, $21, $22, $23,
+			$24, $25, $26, $27,
+			$28, $29
 		)
 		ON CONFLICT (gravacao_id) DO UPDATE SET
-			processado_em       = EXCLUDED.processado_em,
-			transcricao_txt     = EXCLUDED.transcricao_txt,
-			timeline_json       = EXCLUDED.timeline_json,
+			processado_em           = EXCLUDED.processado_em,
+			transcricao_txt         = EXCLUDED.transcricao_txt,
+			transcricao_corrigida   = EXCLUDED.transcricao_corrigida,
+			timeline_json           = EXCLUDED.timeline_json,
 			atendente_json      = EXCLUDED.atendente_json,
 			cliente_json        = EXCLUDED.cliente_json,
 			total_turnos        = EXCLUDED.total_turnos,
@@ -667,7 +781,7 @@ func saveToPostgres(base, txtContent string, timelineJSON, atJSON, clJSON []byte
 			db2_metadata_json   = EXCLUDED.db2_metadata_json
 	`,
 		base, time.Now(),
-		txtContent, timelineJSON, atJSON, clJSON,
+		txtContent, txtCorrected, timelineJSON, atJSON, clJSON,
 		totalTurnos, quality.TurnosAtendente, quality.TurnosCliente, fmt.Sprintf("%.2f", duracao),
 		quality.SnrDb, quality.SilenceRatio, quality.ClippingRatio, quality.DropoutCount, quality.Ch0Rms, quality.Ch1Rms,
 		quality.AudioEnhanced, quality.Diarizer,
