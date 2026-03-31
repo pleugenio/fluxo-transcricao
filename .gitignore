@@ -1,0 +1,50 @@
+# Binários compilados
+*.exe
+*.dll
+*.so
+*.dylib
+pipeline
+pipeline_linux
+
+# Logs
+*.log
+pipeline.log
+pipeline_win.log
+watcher.log
+
+# Arquivos temporários de áudio
+*.wav
+*.mp3
+*.m4a
+atendente.wav
+cliente.wav
+audio_16k.wav
+canal_*.wav
+speaker*.wav
+
+# Diretórios temporários
+temp/
+transcricoes/
+cmd/
+.claude/
+
+# Scripts antigos/descontinuados
+transcribe_simple.py
+parallel_transcribe.py
+copy_audios.bat
+copy_audios.ps1
+
+# Scripts de debug
+check_db.go
+clean_db.go
+clear_db.go
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
