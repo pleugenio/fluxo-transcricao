@@ -687,38 +687,11 @@ func fetchDB2Metadata(id string) DB2Meta {
 		}
 		return m
 	}
-	// Fallback: tentar via SSH na VM (onde Python e ibm_db podem estar instalados)
-	log.Printf("[DB2] Python local falhou para %s, tentando via SSH na VM...", id)
-	sshClient, sftpClient, err := connectSSH()
-	if err != nil {
-		log.Printf("[DB2] SSH falhou para %s: %v", id, err)
-		return DB2Meta{}
-	}
-	defer sshClient.Close()
-	defer sftpClient.Close()
 
-	// Executar fetch_db2.py na VM via SSH
-	session, err := sshClient.NewSession()
-	if err != nil {
-		log.Printf("[DB2] SSH session falhou para %s: %v", id, err)
-		return DB2Meta{}
-	}
-	defer session.Close()
-
-	o, err := session.CombinedOutput(fmt.Sprintf("python3 /home/speaksense/whisper-gpu-test-paralel/fetch_db2.py %s", id))
-	if err != nil {
-		log.Printf("[DB2] SSH exec falhou para %s: %v | output: %s", id, err, string(o))
-		return DB2Meta{}
-	}
-
-	var m DB2Meta
-	if err := json.Unmarshal(o, &m); err != nil {
-		log.Printf("[DB2] ERRO JSON via SSH para %s: %v | output: %s", id, err, string(o))
-		return DB2Meta{}
-	}
-
-	log.Printf("[DB2] Metadados obtidos via SSH para %s", id)
-	return m
+	// Python local não conseguiu buscar, retorna vazio
+	// Metadados DB2 serão deixados como NULL no PostgreSQL
+	log.Printf("[DB2] Python não conseguiu buscar metadados para %s - serão deixados como NULL", id)
+	return DB2Meta{}
 }
 
 func saveToPostgres(base, txtContent, txtCorrected string, timelineJSON, atJSON, clJSON []byte,
