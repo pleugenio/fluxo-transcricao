@@ -664,6 +664,7 @@ func fetchDB2Metadata(id string) DB2Meta {
 			strings.Contains(e, "not recognized")
 	}
 
+	// Tenta Python local primeiro
 	for _, c := range candidates {
 		o, err := exec.Command(c.cmd, c.args...).CombinedOutput()
 		if err != nil {
@@ -674,24 +675,53 @@ func fetchDB2Metadata(id string) DB2Meta {
 			}
 			if badPath(outStr) {
 				// Python rodou mas não achou o script — tenta próximo candidato
-				log.Printf("[DB2] script não encontrado via %s (%s)", c.cmd, scriptPath)
 				continue
 			}
-			log.Printf("[DB2] ERRO ao buscar metadados para %s (%s): %v | %s", id, c.cmd, err, outStr)
-			return DB2Meta{}
+			// Erro real, mas não retorna ainda — vai tentar SSH
+		} else {
+			// Sucesso local
+			var m DB2Meta
+			if err := json.Unmarshal(o, &m); err != nil {
+				log.Printf("[DB2] ERRO JSON para %s: %v | output: %s", id, err, string(o))
+				return DB2Meta{}
+			}
+			log.Printf("[DB2] Metadados obtidos localmente para %s", id)
+			return m
 		}
-		var m DB2Meta
-		if err := json.Unmarshal(o, &m); err != nil {
-			log.Printf("[DB2] ERRO JSON para %s: %v | output: %s", id, err, string(o))
-			return DB2Meta{}
-		}
-		return m
 	}
 
-	// Python local não conseguiu buscar, retorna vazio
-	// Metadados DB2 serão deixados como NULL no PostgreSQL
-	log.Printf("[DB2] Python não conseguiu buscar metadados para %s - serão deixados como NULL", id)
-	return DB2Meta{}
+	// Python local falhou, tenta via SSH na VM
+	log.Printf("[DB2] Python local indisponível, tentando via SSH para %s...", id)
+	ssh, sftp, err := connectSSH()
+	if err != nil {
+		log.Printf("[DB2] SSH falhou: %v - metadados não serão preenchidos", err)
+		return DB2Meta{}
+	}
+	defer ssh.Close()
+	defer sftp.Close()
+
+	session, err := ssh.NewSession()
+	if err != nil {
+		log.Printf("[DB2] SSH session falhou: %v", err)
+		return DB2Meta{}
+	}
+	defer session.Close()
+
+	// Executa fetch_db2.py na VM
+	out, err := session.Output(fmt.Sprintf("cd /home/speaksense && python3 fetch_db2.py %s", id))
+	if err != nil {
+		log.Printf("[DB2] ERRO ao executar fetch_db2.py na VM para %s: %v", id, err)
+		return DB2Meta{}
+	}
+
+	var m DB2Meta
+	if err := json.Unmarshal(out, &m); err != nil {
+		log.Printf("[DB2] ERRO JSON para %s (via SSH): %v | output: %s", id, err, string(out))
+		return DB2Meta{}
+	}
+
+	log.Printf("[DB2] Metadados obtidos via SSH para %s", id)
+	return m
 }
 
 func saveToPostgres(base, txtContent, txtCorrected string, timelineJSON, atJSON, clJSON []byte,

@@ -1,0 +1,29 @@
+=== DIAGNÓSTICO - POR QUE METADADOS NÃO ESTÃO SENDO INSERIDOS ===
+
+PROBLEMA: Dados estão sendo transcritos e salvos no PostgreSQL, MAS sem metadados
+(nme_pessoa, nme_profissional, dsc_equipe, etc. aparecem como NULL).
+
+CAUSA IDENTIFICADA:
+❌ Servidor DB2 "brussels.srv.lbv.org.br" não é acessível
+
+TESTES REALIZADOS:
+1. ✓ PostgreSQL está funcionando (53 registros já inseridos)
+2. ✓ SSH para VM funciona
+3. ✓ Python3 e ibm_db estão na VM
+4. ❌ DB2 retorna erro: "The remote host \"brussels.srv.lbv.org.br\" was not found"
+
+HISTÓRICO DA SOLUÇÃO:
+- Tentativa 1: Executar fetch_db2.py localmente → Python não estava instalado no Windows
+- Tentativa 2: Modificar para executar via SSH → Funciona, mas DB2 é inacessível
+- Status Atual: Código está correto, problema é de infraestrutura/rede
+
+OPÇÕES:
+1. Verificar conectividade de rede para DB2 (IT/DevOps)
+2. Continuar processando sem metadados por enquanto
+3. Usar dados de teste/mock para validar o fluxo
+4. Implementar cache de metadados para reduzir chamadas ao DB2
+
+EVIDÊNCIA:
+$ cd /home/speaksense && python3 fetch_db2.py 764818206
+{"error": "[IBM][CLI Driver] SQL1336N The remote host \"brussels.srv.lbv.org.br\" was not found. SQLSTATE=08001 SQLCODE=-1336"}
+
