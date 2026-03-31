@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	localWatchDir  = "C:/Audios"
+	localWatchDir  = "./audios"
 	stage2Upload   = "./temp/2_upload"
 	stage3Gpu      = "./temp/3_gpu"
 	stage4Download = "./temp/4_done"
