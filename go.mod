@@ -3,12 +3,15 @@ module fluxo-transcricao
 go 1.25.7
 
 require (
+	github.com/alexbrainman/odbc v0.0.0-20250601004241-49e6b2bc0cf0
+	github.com/ibmdb/go_ibm_db v0.5.4
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/pkg/sftp v1.13.10
 	golang.org/x/crypto v0.48.0
 )
 
 require (
+	github.com/ibmruntimes/go-recordio/v2 v2.0.0-20240416213906-ae0ad556db70 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

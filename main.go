@@ -2,18 +2,19 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	_ "github.com/alexbrainman/odbc"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -34,6 +35,14 @@ const (
 	remoteTransDir = "/home/speaksense/whisper-gpu-test-paralel/transcricoes"
 
 	postgresURL = "postgres://srvbi:NbHo2WB8EyzatlPjmD1e@10.0.68.39:5433/transcriberdb"
+
+	db2DSN = "Driver={IBM DB2 ODBC DRIVER};" +
+		"Database=DBPD01;" +
+		"Hostname=brussels.srv.lbv.org.br;" +
+		"Port=60001;" +
+		"Protocol=TCPIP;" +
+		"UID=srvapnpbi;" +
+		"PWD=1oonSwtLMvzZ9tTRFP0X;"
 )
 
 // Segment representa uma fala com timestamps (usado na timeline e por canal).
@@ -630,97 +639,64 @@ func fetchDB2Metadata(id string) DB2Meta {
 		return DB2Meta{}
 	}
 
-	// Localiza fetch_db2.py relativo ao executável (robusto para Linux/WSL/Windows)
-	scriptPath := "fetch_db2.py"
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "fetch_db2.py")
-		if _, serr := os.Stat(candidate); serr == nil {
-			scriptPath = candidate
-		}
-	}
-
-	// Candidatos em ordem de preferência (Linux-first para binário nativo WSL)
-	type candidate struct {
-		cmd  string
-		args []string
-	}
-	candidates := []candidate{
-		{"/usr/bin/python3",    []string{scriptPath, id}},
-		{"/usr/local/bin/python3", []string{scriptPath, id}},
-		{"python3",             []string{scriptPath, id}},
-		{"python",              []string{scriptPath, id}},
-		{"python3.exe",         []string{scriptPath, id}},
-		{"python.exe",          []string{scriptPath, id}},
-	}
-
-	badPath := func(s string) bool {
-		return strings.Contains(s, "can't open file") ||
-			strings.Contains(s, "No such file or directory") ||
-			strings.Contains(s, "cannot find the path")
-	}
-	notFound := func(e string) bool {
-		return strings.Contains(e, "not found") ||
-			strings.Contains(e, "file not found") ||
-			strings.Contains(e, "not recognized")
-	}
-
-	// Tenta Python local primeiro
-	for _, c := range candidates {
-		o, err := exec.Command(c.cmd, c.args...).CombinedOutput()
-		if err != nil {
-			errStr := err.Error()
-			outStr := string(o)
-			if notFound(errStr) {
-				continue // interpretador não instalado
-			}
-			if badPath(outStr) {
-				// Python rodou mas não achou o script — tenta próximo candidato
-				continue
-			}
-			// Erro real, mas não retorna ainda — vai tentar SSH
-		} else {
-			// Sucesso local
-			var m DB2Meta
-			if err := json.Unmarshal(o, &m); err != nil {
-				log.Printf("[DB2] ERRO JSON para %s: %v | output: %s", id, err, string(o))
-				return DB2Meta{}
-			}
-			log.Printf("[DB2] Metadados obtidos localmente para %s", id)
-			return m
-		}
-	}
-
-	// Python local falhou, tenta via SSH na VM
-	log.Printf("[DB2] Python local indisponível, tentando via SSH para %s...", id)
-	ssh, sftp, err := connectSSH()
+	// Conecta ao DB2 via ODBC (Windows nativo)
+	db, err := sql.Open("odbc", db2DSN)
 	if err != nil {
-		log.Printf("[DB2] SSH falhou: %v - metadados não serão preenchidos", err)
+		log.Printf("[DB2] ERRO ao abrir conexão ODBC para %s: %v", id, err)
 		return DB2Meta{}
 	}
-	defer ssh.Close()
-	defer sftp.Close()
+	defer db.Close()
 
-	session, err := ssh.NewSession()
-	if err != nil {
-		log.Printf("[DB2] SSH session falhou: %v", err)
+	// Testa a conexão
+	if err := db.Ping(); err != nil {
+		log.Printf("[DB2] ERRO ao conectar DB2 para %s: %v", id, err)
 		return DB2Meta{}
 	}
-	defer session.Close()
 
-	// Executa fetch_db2.py na VM
-	out, err := session.Output(fmt.Sprintf("cd /home/speaksense && python3 fetch_db2.py %s", id))
-	if err != nil {
-		log.Printf("[DB2] ERRO ao executar fetch_db2.py na VM para %s: %v", id, err)
-		return DB2Meta{}
-	}
+	// Query para buscar metadados
+	query := `
+		SELECT
+			PE.NME_PESSOA,
+			pr.nme_profissional,
+			eq.dsc_equipe,
+			cla.TPO_LIGACAO,
+			cla.DTA_CRIACAO,
+			cla.DTA_DISCAGEM,
+			cla.DTA_INICIO_LIGACAO,
+			cla.DTA_FIM_LIGACAO,
+			ca.dsc_campanha
+		FROM cct.CCT_LIGACAO_ATENDIDA cla
+		INNER JOIN cct.CCT_GRV_GRAVACAO cgg ON cgg.CDG_CLIENTE = cla.SQC_LIGACAO_ATENDIDA
+		INNER JOIN glb.glb_pessoa pe on cla.cdg_pessoa = pe.cdg_pessoa
+		inner join apn.apn_profissional pr on pr.cdg_profissional = cla.cdg_profissional
+		inner join apn.apn_equipe eq on eq.cdg_equipe = cla.cdg_equipe
+		inner join cct.cct_campanha ca on ca.cdg_campanha = cla.cdg_campanha
+		WHERE cgg.sqc_gravacao = ?
+	`
 
 	var m DB2Meta
-	if err := json.Unmarshal(out, &m); err != nil {
-		log.Printf("[DB2] ERRO JSON para %s (via SSH): %v | output: %s", id, err, string(out))
+	err = db.QueryRow(query, id).Scan(
+		&m.NmePessoa,
+		&m.NmeProfissional,
+		&m.DscEquipe,
+		&m.TpoLigacao,
+		&m.DtaCriacao,
+		&m.DtaDiscagem,
+		&m.DtaInicioLigacao,
+		&m.DtaFimLigacao,
+		&m.DscCampanha,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[DB2] Nenhum registro encontrado para %s", id)
+		} else {
+			log.Printf("[DB2] ERRO ao buscar metadados para %s: %v", id, err)
+		}
 		return DB2Meta{}
 	}
 
-	log.Printf("[DB2] Metadados obtidos via SSH para %s", id)
+	log.Printf("[DB2] ✓ Metadados obtidos para %s: %s / %s / %s", id, m.NmePessoa, m.NmeProfissional, m.DscCampanha)
 	return m
 }
 
