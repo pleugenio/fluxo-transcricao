@@ -130,6 +130,13 @@ var correctionDict = map[string]string{
 	"Dana.":  "Dona.",
 	"Dana?":  "Dona?",
 
+	// Transcrição incompleta de "não" (284 ocorrências)
+	// Whisper cortou o final da palavra
+	" nã ":   " não ",
+	" nã.":   " não.",
+	" nã,":   " não,",
+	" nã?":   " não?",
+
 	// Telefone/CPF com espaço antes de hífen (3+ ocorrências)
 	// Nota: padrão regex aplicado separadamente
 }
