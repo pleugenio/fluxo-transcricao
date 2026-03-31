@@ -152,6 +152,15 @@ func correctText(text string) string {
 	reHyphen := regexp.MustCompile(`(\d)\s+-(\d)`)
 	text = reHyphen.ReplaceAllString(text, "$1-$2")
 
+	// Regex: Reduz espaços duplos para simples (52 ocorrências encontradas)
+	reDoubleSpace := regexp.MustCompile(`\s{2,}`)
+	text = reDoubleSpace.ReplaceAllString(text, " ")
+
+	// Regex: Remove pontuação duplicada (81 ocorrências encontradas)
+	// Padrão: ".." "??" ",," → "." "?" ","
+	reDupPunct := regexp.MustCompile(`([.?!,;:])\1{1,}`)
+	text = reDupPunct.ReplaceAllString(text, "$1")
+
 	return text
 }
 
