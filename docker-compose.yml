@@ -1,0 +1,59 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database (LOCAL)
+  db:
+    image: postgres:15-alpine
+    container_name: transcricao-db
+    environment:
+      POSTGRES_USER: srvbi
+      POSTGRES_PASSWORD: NbHo2WB8EyzatlPjmD1e
+      POSTGRES_DB: transcriberdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - transcricao-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U srvbi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Pipeline Orchestrator (LOCAL ONLY)
+  # Comunica com VM via SSH para enviar áudios
+  # Busca metadados no DB2 via ODBC local
+  # Salva em PostgreSQL local
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: transcricao-pipeline
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_URL: "postgres://srvbi:NbHo2WB8EyzatlPjmD1e@db:5432/transcriberdb"
+      REMOTE_HOST: "20.127.212.253"
+      REMOTE_USER: "speaksense"
+      REMOTE_KEY: "/app/vm-speaksense-eus-dev_key.pem"
+    volumes:
+      - ./audios:/app/audios              # Áudios para processar
+      - ./temp:/app/temp                  # Diretórios temp
+      - ./transcricoes:/app/transcricoes  # Saídas
+    networks:
+      - transcricao-net
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  transcricao-net:
+    driver: bridge

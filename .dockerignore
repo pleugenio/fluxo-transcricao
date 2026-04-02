@@ -1,0 +1,57 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.o
+*.so
+*.a
+
+# Logs
+*.log
+logs/
+
+# Directories to exclude
+node_modules/
+vendor/
+.env.local
+.env.*.local
+
+# Large files
+*.mp3
+*.wav
+*.zip
+*.tar
+*.tar.gz
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.circleci/
+
+# Temp
+temp/
+audios_old/
+
+# Documentação
+README.md
+DOCKER.md
+*.md
