@@ -3,13 +3,12 @@ FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
-# Copia arquivos Go
-COPY *.go ./
-COPY go.mod ./
-COPY go.sum ./
+# Copia arquivos Go (apenas os necessários para o pipeline)
+COPY main.go web.go ./
+COPY go.mod go.sum ./
 
 # Build
-RUN go build -o pipeline .
+RUN go build -o pipeline main.go web.go
 
 # Stage 2: Runtime (minimalista)
 FROM alpine:latest
