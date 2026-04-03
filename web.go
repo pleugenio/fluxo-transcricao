@@ -15,9 +15,10 @@ func startWebServer() {
 	http.HandleFunc("/upload", handleUpload)
 	http.HandleFunc("/files", handleListFiles)
 
-	fmt.Println("📱 Servidor web iniciado em http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Printf("Erro ao iniciar servidor: %v\n", err)
+	fmt.Println("📱 Servidor web iniciando na porta 8080...")
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		fmt.Printf("❌ Erro ao iniciar servidor web: %v\n", err)
 	}
 }
 
