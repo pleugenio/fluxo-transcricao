@@ -243,6 +243,37 @@ func main() {
 	select {}
 }
 
+// moveFile tenta rename, mas usa copy+delete se houver cross-device link (Docker)
+func moveFile(src, dst string) error {
+	err := moveFile(src, dst)
+	if err == nil {
+		return nil
+	}
+
+	// Se erro de cross-device link, usa copy + delete
+	if strings.Contains(err.Error(), "cross-device link") || strings.Contains(err.Error(), "invalid cross-device link") {
+		srcFile, err := os.Open(src)
+		if err != nil {
+			return err
+		}
+		defer srcFile.Close()
+
+		dstFile, err := os.Create(dst)
+		if err != nil {
+			return err
+		}
+		defer dstFile.Close()
+
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			return err
+		}
+
+		return os.Remove(src)
+	}
+
+	return err
+}
+
 // sourceProcessorService move o MP3 original da pasta de entrada para o stage de upload.
 func sourceProcessorService() {
 	for {
@@ -270,7 +301,7 @@ func sourceProcessorService() {
 				dest := filepath.Join(stage2Upload, fn)
 				for attempt := 1; attempt <= 5; attempt++ {
 					log.Printf("[Source] %s: movendo para upload (tentativa %d)...", base, attempt)
-					if err := os.Rename(filepath.Join(localWatchDir, fn), dest); err == nil {
+					if err := moveFile(filepath.Join(localWatchDir, fn), dest); err == nil {
 						recordTime(base, "split_done")
 						log.Printf("[Source] %s: OK", base)
 						break
@@ -354,7 +385,7 @@ func uploaderService() {
 
 				// Marca como enviado; move local para audios_old
 				os.WriteFile(filepath.Join(stage2Upload, b+".ready"), []byte(time.Now().String()), 0644)
-				os.Rename(localPath, filepath.Join(localOldDir, fn))
+				moveFile(localPath, filepath.Join(localOldDir, fn))
 				log.Printf("[Uploader] %s: OK", b)
 			}(base, name)
 		}
