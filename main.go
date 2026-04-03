@@ -164,7 +164,13 @@ func correctText(text string) string {
 }
 
 func initPostgres() error {
-	db, err := pgxpool.New(context.Background(), postgresURL)
+	// Use POSTGRES_URL environment variable if set (Docker), otherwise use default
+	dbURL := os.Getenv("POSTGRES_URL")
+	if dbURL == "" {
+		dbURL = postgresURL
+	}
+
+	db, err := pgxpool.New(context.Background(), dbURL)
 	if err != nil {
 		return err
 	}
