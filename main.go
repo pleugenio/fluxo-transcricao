@@ -231,6 +231,9 @@ func main() {
 
 	log.Printf(">>> INICIANDO PIPELINE DE TRANSCRIÇÃO <<<")
 
+	// Inicia servidor web de upload em goroutine separada
+	go startWebServer()
+
 	go sourceProcessorService()
 	go uploaderService()
 	go gpuWatcherService()
