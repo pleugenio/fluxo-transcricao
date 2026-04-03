@@ -4,9 +4,9 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /app
 
 # Copia arquivos Go
-COPY *.go .
-COPY go.mod .
-COPY go.sum .
+COPY *.go ./
+COPY go.mod ./
+COPY go.sum ./
 
 # Build
 RUN go build -o pipeline .
