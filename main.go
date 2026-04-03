@@ -245,7 +245,7 @@ func main() {
 
 // moveFile tenta rename, mas usa copy+delete se houver cross-device link (Docker)
 func moveFile(src, dst string) error {
-	err := moveFile(src, dst)
+	err := os.Rename(src, dst)
 	if err == nil {
 		return nil
 	}
