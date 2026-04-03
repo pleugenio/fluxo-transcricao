@@ -4,12 +4,12 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /app
 
 # Copia arquivos Go
-COPY main.go .
+COPY *.go .
 COPY go.mod .
 COPY go.sum .
 
 # Build
-RUN go build -o pipeline main.go
+RUN go build -o pipeline .
 
 # Stage 2: Runtime (minimalista)
 FROM alpine:latest
