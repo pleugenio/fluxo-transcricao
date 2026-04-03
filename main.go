@@ -14,8 +14,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/alexbrainman/odbc"
-	"github.com/jackc/pgx/v5/pgxpool"
+"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
