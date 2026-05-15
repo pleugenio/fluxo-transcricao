@@ -30,7 +30,7 @@ VOLUME ["/app/audios", "/app/temp"]
 # Variáveis de ambiente
 ENV POSTGRES_URL="postgres://srvbi:NbHo2WB8EyzatlPjmD1e@db:5432/transcriberdb"
 ENV REMOTE_HOST="172.31.24.27"
-ENV REMOTE_USER="speaksense"
+ENV REMOTE_USER="ubuntu"
 ENV REMOTE_KEY="/app/Chave_Temp_Paulo.pem"
 
 CMD ["./pipeline"]
