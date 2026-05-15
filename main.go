@@ -30,8 +30,8 @@ const (
 	remoteHost     = "172.31.24.27"
 	remoteUser     = "ubuntu"
 	remoteKeyPath  = "Chave_Temp_Paulo.pem"
-	remoteAudioDir = "/home/speaksense/whisper-gpu-test-paralel/audios"
-	remoteTransDir = "/home/speaksense/whisper-gpu-test-paralel/transcricoes"
+	remoteAudioDir = "/home/ubuntu/whisper-gpu-test-paralel/audios"
+	remoteTransDir = "/home/ubuntu/whisper-gpu-test-paralel/transcricoes"
 
 	postgresURL = "postgres://srvbi:NbHo2WB8EyzatlPjmD1e@10.0.68.39:5433/transcriberdb"
 
