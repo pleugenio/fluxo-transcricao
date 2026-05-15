@@ -20,17 +20,17 @@ WORKDIR /app
 # Copia binário do builder
 COPY --from=builder /app/pipeline .
 
-# SSH key para conexão com VM
-COPY vm-speaksense-eus-dev_key.pem .
-RUN chmod 600 vm-speaksense-eus-dev_key.pem
+# SSH key para conexão com VM (AWS)
+COPY Chave_Temp_Paulo.pem .
+RUN chmod 600 Chave_Temp_Paulo.pem
 
 # Volumes
 VOLUME ["/app/audios", "/app/temp"]
 
 # Variáveis de ambiente
 ENV POSTGRES_URL="postgres://srvbi:NbHo2WB8EyzatlPjmD1e@db:5432/transcriberdb"
-ENV REMOTE_HOST="20.127.212.253"
+ENV REMOTE_HOST="172.31.24.27"
 ENV REMOTE_USER="speaksense"
-ENV REMOTE_KEY="/app/vm-speaksense-eus-dev_key.pem"
+ENV REMOTE_KEY="/app/Chave_Temp_Paulo.pem"
 
 CMD ["./pipeline"]

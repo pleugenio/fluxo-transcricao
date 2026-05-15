@@ -27,9 +27,9 @@ const (
 	localOldDir    = "./audios_old"
 	localTransDir  = "./transcricoes"
 
-	remoteHost     = "20.127.212.253"
+	remoteHost     = "172.31.24.27"
 	remoteUser     = "speaksense"
-	remoteKeyPath  = "vm-speaksense-eus-dev_key.pem"
+	remoteKeyPath  = "Chave_Temp_Paulo.pem"
 	remoteAudioDir = "/home/speaksense/whisper-gpu-test-paralel/audios"
 	remoteTransDir = "/home/speaksense/whisper-gpu-test-paralel/transcricoes"
 
