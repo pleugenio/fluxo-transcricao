@@ -157,7 +157,7 @@ func correctText(text string) string {
 
 	// Regex: Remove pontuação duplicada (81 ocorrências encontradas)
 	// Padrão: ".." "??" ",," → "." "?" ","
-	reDupPunct := regexp.MustCompile(`([.?!,;:])\1{1,}`)
+	reDupPunct := regexp.MustCompile("([.?!,;:])\\1{1,}")
 	text = reDupPunct.ReplaceAllString(text, "$1")
 
 	return text
@@ -689,6 +689,12 @@ func isMP3ID(id string) bool {
 }
 
 func fetchDB2Metadata(id string) DB2Meta {
+	// DB2 não está disponível em Docker (Windows-only ODBC driver)
+	// Retorna metadados vazios para todos os IDs
+	log.Printf("[DB2] DB2 indisponível em Docker - metadata vazia para %s", id)
+	return DB2Meta{}
+
+	/* Código original comentado:
 	// WAV internos não têm registro no DB2
 	if !isMP3ID(id) {
 		return DB2Meta{}
@@ -753,6 +759,7 @@ func fetchDB2Metadata(id string) DB2Meta {
 
 	log.Printf("[DB2] ✓ Metadados obtidos para %s: %s / %s / %s", id, m.NmePessoa, m.NmeProfissional, m.DscCampanha)
 	return m
+	*/
 }
 
 func saveToPostgres(base, txtContent, txtCorrected string, timelineJSON, atJSON, clJSON []byte,
